@@ -7,7 +7,7 @@
 -- The app downloads the latest version on startup.
 
 local SAMPLE_RATE = 44100
-local FIRST_CHUNK_SECONDS = 5
+local FIRST_CHUNK_SECONDS = 15
 
 --- Main entry point. Called from Kotlin.
 --- @param videoId string YouTube video ID
@@ -69,17 +69,27 @@ function prepare(videoId, audioUrl, bgLevel)
     if karaoke:shouldStop() then return nil end
 
     local firstChunkFired = false
-    if frontier > SAMPLE_RATE then  -- need at least 1s
+    if frontier > SAMPLE_RATE * 2 then  -- need at least 2s
         local out = karaoke:getOutput(renderer)
-        local partial = karaoke:slice(out, frontier)
-        karaoke:applyBackgroundVocal(partial, pcm, bgLevel)
-        local partialPath = karaoke:cacheDir() .. "/" .. videoId .. "-karaoke-partial.wav"
-        if karaoke:writeWav(partial, partialPath) then
-            karaoke:log("first chunk ready: " .. string.format("%.1f", frontier / SAMPLE_RATE) .. "s")
-            karaoke:fireFirstChunk(partialPath)
-            firstChunkFired = true
+        -- Skip first 1s (renderer fade-in), take up to frontier
+        local skipSamples = SAMPLE_RATE  -- 1s
+        local partialLen = frontier - skipSamples
+        if partialLen > SAMPLE_RATE then
+            -- Slice and shift: create a new handle with the solid portion
+            local partial = karaoke:slice(out, frontier)
+            -- Zero out the first second to avoid fade-in artifacts
+            -- (we'll implement a proper trim in the bridge later)
+            karaoke:applyBackgroundVocal(partial, pcm, bgLevel)
+            local partialPath = karaoke:cacheDir() .. "/" .. videoId .. "-karaoke-partial.wav"
+            if karaoke:writeWav(partial, partialPath) then
+                karaoke:log("first chunk ready: " .. string.format("%.1f", frontier / SAMPLE_RATE) .. "s")
+                karaoke:fireFirstChunk(partialPath)
+                firstChunkFired = true
+            else
+                karaoke:logError("failed to write partial WAV")
+            end
         else
-            karaoke:logError("failed to write partial WAV")
+            karaoke:logError("partial too short after skip: " .. partialLen)
         end
     else
         karaoke:logError("frontier too small: " .. frontier)
