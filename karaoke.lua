@@ -49,14 +49,16 @@ function prepare(videoId, audioUrl, bgLevel)
     end
 
     -- 4. Decode to 44.1kHz mono PCM.
+    -- OPTIMIZATION: Decode only 30s for fast startup (not the full song).
+    -- The full decode happens in background after the first chunk plays.
     karaoke:fireProgress(0.15, "Decoding audio...")
-    local pcm = karaoke:decodeAudio(audioPath)
+    local pcm = karaoke:decodeAudioPartial(audioPath, 30)
     if pcm == nil then
-        karaoke:logError("FAILED at decodeAudio")
+        karaoke:logError("FAILED at decodeAudioPartial")
         return nil
     end
     local pcmLen = karaoke:pcmLength(pcm)
-    karaoke:log("decoded " .. pcmLen .. " samples (" .. string.format("%.1f", pcmLen / SAMPLE_RATE) .. "s)")
+    karaoke:log("decoded " .. pcmLen .. " samples (" .. string.format("%.1f", pcmLen / SAMPLE_RATE) .. "s) [partial]")
     if karaoke:shouldStop() then return nil end
 
     -- 5. Progressive separation.
@@ -97,13 +99,25 @@ function prepare(videoId, audioUrl, bgLevel)
     if karaoke:shouldStop() then return nil end
 
     -- Phase 2: render the rest in the background.
+    -- Now do the FULL decode (the file is still there) and render the complete song.
     karaoke:fireProgress(0.80, "Finishing...")
-    karaoke:renderUntil(renderer, pcmLen - 1)
+    karaoke:log("Phase 2: full decode for background render...")
+    local fullPcm = karaoke:decodeAudio(audioPath)
+    if fullPcm == nil then
+        karaoke:logError("FAILED at full decodeAudio in Phase 2")
+        return nil
+    end
+    local fullPcmLen = karaoke:pcmLength(fullPcm)
+    karaoke:log("full decoded " .. fullPcmLen .. " samples (" .. string.format("%.1f", fullPcmLen / SAMPLE_RATE) .. "s)")
+    
+    -- Create a new renderer for the full song
+    local fullRenderer = karaoke:createRenderer(fullPcm)
+    karaoke:renderUntil(fullRenderer, fullPcmLen - 1)
     if karaoke:shouldStop() then return nil end
 
     -- Write the full WAV.
-    local out = karaoke:getOutput(renderer)
-    karaoke:applyBackgroundVocal(out, pcm, bgLevel)
+    local out = karaoke:getOutput(fullRenderer)
+    karaoke:applyBackgroundVocal(out, fullPcm, bgLevel)
     local key = karaoke:cacheKey(videoId, bgLevel)
     local outPath = karaoke:cacheDir() .. "/" .. key
     if not karaoke:writeWav(out, outPath) then
