@@ -98,26 +98,15 @@ function prepare(videoId, audioUrl, bgLevel)
     end
     if karaoke:shouldStop() then return nil end
 
-    -- Phase 2: render the rest in the background.
-    -- Now do the FULL decode (the file is still there) and render the complete song.
+    -- Phase 2: render the rest of the partial (up to 30s) in the background.
+    -- NO re-decode: use the 30s we already have. Full song support comes later.
     karaoke:fireProgress(0.80, "Finishing...")
-    karaoke:log("Phase 2: full decode for background render...")
-    local fullPcm = karaoke:decodeAudio(audioPath)
-    if fullPcm == nil then
-        karaoke:logError("FAILED at full decodeAudio in Phase 2")
-        return nil
-    end
-    local fullPcmLen = karaoke:pcmLength(fullPcm)
-    karaoke:log("full decoded " .. fullPcmLen .. " samples (" .. string.format("%.1f", fullPcmLen / SAMPLE_RATE) .. "s)")
-    
-    -- Create a new renderer for the full song
-    local fullRenderer = karaoke:createRenderer(fullPcm)
-    karaoke:renderUntil(fullRenderer, fullPcmLen - 1)
+    karaoke:log("Phase 2: rendering remaining partial (no re-decode)...")
+    karaoke:renderUntil(renderer, pcmLen - 1)
     if karaoke:shouldStop() then return nil end
 
-    -- Write the full WAV.
-    local out = karaoke:getOutput(fullRenderer)
-    karaoke:applyBackgroundVocal(out, fullPcm, bgLevel)
+    -- Write the full WAV (30s for now).
+    local out = karaoke:getOutput(renderer)
     local key = karaoke:cacheKey(videoId, bgLevel)
     local outPath = karaoke:cacheDir() .. "/" .. key
     if not karaoke:writeWav(out, outPath) then
