@@ -124,8 +124,14 @@ function prepare(videoId, audioUrl, bgLevel)
     end
 
     -- Phase 3: Full song in background.
-    -- The 10s version is playing. Now decode the FULL song, render it,
-    -- and swap to the full version. Only the full song goes to cache.
+    -- The 10s version is playing. Now decode the FULL song, render it in
+    -- 30s chunks, and swap to longer files as they're ready.
+    -- Free the 10s PCM first to make room for the full song (OOM prevention).
+    karaoke:log("Phase 3: freeing 10s buffers...")
+    pcm = nil
+    renderer = nil
+    collectgarbage("collect")
+    
     karaoke:log("Phase 3: decoding full song in background...")
     local fullPcm = karaoke:decodeAudio(audioPath)
     if fullPcm == nil then
