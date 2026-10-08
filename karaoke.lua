@@ -1,10 +1,18 @@
--- karaoke.lua v9 - KaraokeNow vocal removal pipeline
+-- karaoke.lua v11 - KaraokeNow vocal removal pipeline
 -- This script orchestrates the karaoke preparation flow.
 -- Heavy lifting (download, decode, AI inference, PCM I/O) is done by
 -- the Kotlin bridge exposed as the global `karaoke`.
 --
 -- To update karaoke logic: edit this file, no app rebuild needed.
 -- The app downloads the latest version on startup.
+--
+-- Keep this header in sync with SCRIPT_VERSION in LuaEngine.kt.
+--
+-- v11: First chunk is TWO windows instead of one.
+--      The panel's refresh-rate vote flaps while the video briefly waits
+--      on the bursty audio supply, which showed up as fps dipping to ~57
+--      in stretches. A deeper initial buffer (8.89s of audio instead of
+--      4.44s) shortens that early-playback window.
 --
 -- v9: Continuous streaming renderer (fixes playback stuttering).
 --     - ONE MdxRenderer pass over the whole song (no per-segment resets).
