@@ -101,18 +101,24 @@ function prepare(videoId, audioUrl, bgLevel)
     end
     if karaoke:shouldStop() then return nil end
 
-    -- 7. Render the rest of the 10s and append.
+    -- 7. Render the rest of the 10s and append the REMAINDER.
+    -- Phase 1 appended up to `frontier` (8.88s). Now append from frontier to pcmLen (10s).
     karaoke:fireProgress(0.60, "Rendering 10s...")
+    local frontierBefore = frontier
     karaoke:renderUntil(renderer, pcmLen - 1)
     if karaoke:shouldStop() then return nil end
     local out10 = karaoke:getOutput(renderer)
     karaoke:applyBackgroundVocal(out10, pcm, bgLevel)
-    -- Append only the NEW samples (beyond what we already appended).
-    -- For simplicity, we re-append the full 10s; the player will have
-    -- a small overlap. Better: track appended count.
-    -- v8 simplification: append the 10s segment (samples beyond first chunk).
-    -- Actually, to avoid complexity, we just continue streaming from 10s.
-    karaoke:log("10s rendered, continuing to stream from 10s...")
+    -- Slice the new samples (from frontierBefore to pcmLen) and append.
+    local remainderLen = pcmLen - frontierBefore
+    if remainderLen > 0 then
+        local remainder = karaoke:sliceOffset(out10, frontierBefore, remainderLen)
+        if karaoke:appendPcm(remainder, pcmPath) then
+            karaoke:log("10s remainder appended: " .. string.format("%.1f", remainderLen / SAMPLE_RATE) .. "s")
+        else
+            karaoke:logError("failed to append 10s remainder")
+        end
+    end
 
     -- Free 10s buffers.
     pcm = nil
