@@ -134,11 +134,8 @@ function prepare(videoId, audioUrl, bgLevel)
     renderer = nil
     collectgarbage("collect")
 
-    -- Get the total duration from the audio file (decode a tiny bit to get length).
-    -- We'll stream segments until decode returns empty/short.
     karaoke:log("Phase 3: streaming 10s chunks...")
     local chunkSeconds = 10
-    local overlapSeconds = 1  -- 1s overlap for model context at boundaries
     local chunkNum = 2  -- Chunk 1 was the 8.88s partial, chunk 2 was the 10s file
     local startSec = FAST_START_SECONDS  -- Start from 10s
 
@@ -148,12 +145,11 @@ function prepare(videoId, audioUrl, bgLevel)
             break
         end
 
-        -- Decode [startSec - overlap, startSec + chunkSeconds + overlap]
-        -- The overlap gives the model context; we slice the middle 10s.
-        local decodeStart = math.max(0, startSec - overlapSeconds)
-        local decodeEnd = startSec + chunkSeconds + overlapSeconds
-        karaoke:log("Phase 3: decoding " .. decodeStart .. "s-" .. decodeEnd .. "s...")
-        local segPcm = karaoke:decodeAudioRange(audioPath, decodeStart, decodeEnd)
+        -- Decode exact [startSec, startSec + chunkSeconds] range.
+        -- No overlap: avoids 2s repeat glitch. Minor boundary artifacts acceptable for v7.
+        local decodeEnd = startSec + chunkSeconds
+        karaoke:log("Phase 3: decoding " .. startSec .. "s-" .. decodeEnd .. "s...")
+        local segPcm = karaoke:decodeAudioRange(audioPath, startSec, decodeEnd)
         if segPcm == nil then
             karaoke:logError("Phase 3: decodeAudioRange failed at " .. startSec .. "s, stopping")
             break
@@ -175,23 +171,6 @@ function prepare(videoId, audioUrl, bgLevel)
 
         local segOut = karaoke:getOutput(segRenderer)
         karaoke:applyBackgroundVocal(segOut, segPcm, bgLevel)
-
-        -- Slice the middle 10s (discard overlap regions with boundary artifacts).
-        -- segPcm starts at decodeStart, we want [startSec, startSec+10s].
-        local sliceStart = (startSec - decodeStart) * SAMPLE_RATE
-        local sliceLen = math.min(chunkSeconds * SAMPLE_RATE, segLen - sliceStart)
-        if sliceLen <= 0 then
-            karaoke:log("Phase 3: no audio left in segment, stopping")
-            break
-        end
-        -- Note: slice() takes (handle, length) from start; we need offset.
-        -- For simplicity, if decodeStart == startSec - overlap, the slice starts at overlap*SR.
-        -- We'll use the full segment output and let the player handle the slight overlap.
-        -- Actually, to avoid complexity, just use the central 10s.
-        local chunkPcm = karaoke:slice(segOut, sliceStart + sliceLen)
-        -- Trim the head overlap by creating a sub-slice (if supported).
-        -- For v7, we accept the 1s overlap; the concatenating player will have
-        -- a tiny 1s repeat which is barely noticeable. Future: precise slicing.
 
         local chunkPath = karaoke:cacheDir() .. "/" .. videoId .. "-karaoke-stream" .. chunkNum .. ".wav"
         if karaoke:writeWav(segOut, chunkPath) then
@@ -215,7 +194,7 @@ function prepare(videoId, audioUrl, bgLevel)
         startSec = startSec + chunkSeconds
 
         -- Stop if the segment was short (end of song).
-        if segSecs < chunkSeconds + overlapSeconds then
+        if segSecs < chunkSeconds - 1 then
             karaoke:log("Phase 3: last chunk written, streaming complete")
             break
         end
