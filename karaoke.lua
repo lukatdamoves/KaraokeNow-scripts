@@ -1,20 +1,35 @@
--- karaoke.lua v8 - KaraokeNow vocal removal pipeline
+-- karaoke.lua v9 - KaraokeNow vocal removal pipeline
 -- This script orchestrates the karaoke preparation flow.
--- Heavy lifting (download, decode, AI inference, WAV I/O) is done by
+-- Heavy lifting (download, decode, AI inference, PCM I/O) is done by
 -- the Kotlin bridge exposed as the global `karaoke`.
 --
--- v8: Growing PCM streaming.
---     - Single growing raw PCM file (16-bit mono 44.1kHz, no header).
---     - Lua appends PCM data as chunks are rendered via karaoke:appendPcm().
---     - Kotlin reads via GrowingPcmDataSource (blocks briefly at EOF if not complete).
---     - Player sees one continuous audio stream. No chunk boundaries, no desync.
---     - onFirstChunk(pcmPath): fired after first chunk appended (player starts).
---     - onComplete(pcmPath): fired when full song done (player gets EOF).
+-- To update karaoke logic: edit this file, no app rebuild needed.
+-- The app downloads the latest version on startup.
+--
+-- v9: Continuous streaming renderer (fixes playback stuttering).
+--     - ONE MdxRenderer pass over the whole song (no per-segment resets).
+--     - Kotlin decodes the audio sequentially on a background thread
+--       (StreamingDecodeSource) while the GPU renders: decode is ~6x
+--       realtime, inference ~1.3x realtime, so decoding NEVER serializes
+--       with inference (it used to add ~16% on the same thread) and never
+--       gates the pipeline.
+--     - Each finalized block is appended to the growing PCM file the moment
+--       it is rendered (karaoke:renderAppend) - playback sees a
+--       continuously growing stream.
+--     - No per-segment renderer warm-up: the per-10s Hann fade dimple and
+--       the seek-boundary discontinuities of v8 are gone.
+--     - Replay cache: a finished render is marked with a .done file, so
+--       repeat plays start instantly with no re-render at all.
+--
+-- Rate math (TECNO KL8, ~3.4s GPU per window, stride = 4.44s of audio):
+--   4.44 / 3.4 = ~1.3x realtime -> the audio buffer GROWS while playing.
+-- (v8 reset a fresh renderer per 10s segment: 3 GPU windows per 10s audio
+--  plus a 1.6s decode between segments = ~0.8x realtime -> stutter.)
 
 local SAMPLE_RATE = 44100
+-- First chunk threshold: fires after the 2nd window (8.89s of audio,
+-- ~4.5s wall) - enough buffer that playback never starves afterwards.
 local FIRST_CHUNK_SECONDS = 8
-local FAST_START_SECONDS = 10
-local STREAM_CHUNK_SECONDS = 10
 
 --- Main entry point. Called from Kotlin.
 --- @param videoId string YouTube video ID
@@ -24,17 +39,27 @@ local STREAM_CHUNK_SECONDS = 10
 function prepare(videoId, audioUrl, bgLevel)
     karaoke:log("prepare() videoId=" .. videoId .. " bgLevel=" .. bgLevel)
 
-    -- 1. Check cache (full song WAV only, for non-streaming fallback).
+    -- 0. Replay cache: a fully rendered stream from a previous play.
+    local stream = karaoke:streamCache(videoId, bgLevel)
+    if stream ~= "" then
+        karaoke:log("stream cache HIT: " .. stream)
+        karaoke:fireProgress(1.0, "Done")
+        karaoke:fireFirstChunk(stream)
+        karaoke:fireComplete(stream)
+        return stream
+    end
+
+    -- Full-WAV cache (written by older full-song builds), if present.
     local cached = karaoke:cachedKaraoke(videoId, bgLevel)
     if cached ~= "" then
-        karaoke:log("cache HIT (full song): " .. cached)
+        karaoke:log("cache HIT: " .. cached)
         karaoke:fireProgress(1.0, "Done")
         karaoke:fireFirstChunk(cached)
         karaoke:fireComplete(cached)
         return cached
     end
 
-    -- 2. Ensure model loaded.
+    -- 1. Ensure model loaded.
     karaoke:fireProgress(0.05, "Loading AI model...")
     if not karaoke:ensureModel() then
         karaoke:logError("FAILED at ensureModel")
@@ -42,7 +67,7 @@ function prepare(videoId, audioUrl, bgLevel)
     end
     if karaoke:shouldStop() then return nil end
 
-    -- 3. Download audio.
+    -- 2. Download audio.
     karaoke:fireProgress(0.10, "Downloading audio...")
     local audioPath = karaoke:downloadAudio(audioUrl, videoId)
     if audioPath == "" then
@@ -55,141 +80,53 @@ function prepare(videoId, audioUrl, bgLevel)
         return nil
     end
 
-    -- 4. Create the growing PCM file.
-    local pcmPath = karaoke:cacheDir() .. "/" .. videoId .. "-karaoke-stream.pcm"
+    -- 3. Fresh growing PCM file for this render.
+    local pcmPath = karaoke:cacheDir() .. "/" .. karaoke:streamKey(videoId, bgLevel)
     if not karaoke:createPcmFile(pcmPath) then
         karaoke:logError("FAILED at createPcmFile")
         return nil
     end
-    karaoke:log("PCM file created: " .. pcmPath)
 
-    -- 5. Decode 10s for fast startup.
-    karaoke:fireProgress(0.15, "Decoding audio...")
-    local pcm = karaoke:decodeAudioPartial(audioPath, FAST_START_SECONDS)
-    if pcm == nil then
-        karaoke:logError("FAILED at decodeAudioPartial")
+    -- 4. One continuous renderer; the decoder runs ahead on its own thread.
+    karaoke:fireProgress(0.15, "Preparing AI engine...")
+    local handle = karaoke:createStreamRenderer(audioPath)
+    if handle == nil then
+        karaoke:logError("FAILED at createStreamRenderer")
         return nil
     end
-    local pcmLen = karaoke:pcmLength(pcm)
-    karaoke:log("decoded " .. pcmLen .. " samples (" .. string.format("%.1f", pcmLen / SAMPLE_RATE) .. "s) [partial]")
     if karaoke:shouldStop() then return nil end
 
-    -- 6. Render first chunk and append to PCM file.
+    -- 5. Phase 1: render + append until there is enough audio to start.
     karaoke:fireProgress(0.20, "Removing vocals...")
-    local renderer = karaoke:createRenderer(pcm)
-    local firstChunkSamples = math.min(FIRST_CHUNK_SECONDS * SAMPLE_RATE, pcmLen - 1)
-    local frontier = karaoke:renderUntil(renderer, firstChunkSamples)
+    local frontier = karaoke:renderAppend(handle, pcmPath, FIRST_CHUNK_SECONDS * SAMPLE_RATE, bgLevel)
     if karaoke:shouldStop() then return nil end
 
-    if frontier > SAMPLE_RATE * 2 then
-        local out = karaoke:getOutput(renderer)
-        local skipSamples = SAMPLE_RATE  -- Skip 1s (renderer fade-in)
-        local chunk = karaoke:slice(out, frontier)
-        -- Remove the 1s skip by slicing (we need offset support; for now use full)
-        karaoke:applyBackgroundVocal(chunk, pcm, bgLevel)
-        if karaoke:appendPcm(chunk, pcmPath) then
-            karaoke:log("first chunk appended: " .. string.format("%.1f", frontier / SAMPLE_RATE) .. "s")
-            karaoke:fireProgress(0.50, "Starting playback...")
-            karaoke:fireFirstChunk(pcmPath)
-        else
-            karaoke:logError("failed to append first chunk PCM")
-            return nil
-        end
+    if frontier >= SAMPLE_RATE or karaoke:isStreamComplete(handle) then
+        karaoke:log("first chunk ready: " .. string.format("%.1f", frontier / SAMPLE_RATE) .. "s")
+        karaoke:fireProgress(0.50, "Starting playback...")
+        karaoke:fireFirstChunk(pcmPath)
     else
         karaoke:logError("frontier too small: " .. frontier)
         return nil
     end
-    if karaoke:shouldStop() then return nil end
 
-    -- 7. Render the rest of the 10s and append the REMAINDER.
-    -- Phase 1 appended up to `frontier` (8.88s). Now append from frontier to pcmLen (10s).
-    karaoke:fireProgress(0.60, "Rendering 10s...")
-    local frontierBefore = frontier
-    karaoke:renderUntil(renderer, pcmLen - 1)
-    if karaoke:shouldStop() then return nil end
-    local out10 = karaoke:getOutput(renderer)
-    karaoke:applyBackgroundVocal(out10, pcm, bgLevel)
-    -- Slice the new samples (from frontierBefore to pcmLen) and append.
-    local remainderLen = pcmLen - frontierBefore
-    if remainderLen > 0 then
-        local remainder = karaoke:sliceOffset(out10, frontierBefore, remainderLen)
-        if karaoke:appendPcm(remainder, pcmPath) then
-            karaoke:log("10s remainder appended: " .. string.format("%.1f", remainderLen / SAMPLE_RATE) .. "s")
-        else
-            karaoke:logError("failed to append 10s remainder")
-        end
+    -- 6. Phase 2: render the rest of the song, appending block by block.
+    if not karaoke:isStreamComplete(handle) then
+        karaoke:fireProgress(0.60, "Finishing song...")
+        karaoke:renderAppend(handle, pcmPath, -1, bgLevel)
+        if karaoke:shouldStop() then return nil end
     end
 
-    -- Free 10s buffers.
-    pcm = nil
-    renderer = nil
-    collectgarbage("collect")
-
-    -- 8. Stream 10s chunks: decode range, render, append PCM.
-    -- Each chunk takes ~7s (decode 1.6s + render 5.9s).
-    -- The player reads the growing file; no per-chunk callback needed.
-    karaoke:log("Phase 3: streaming 10s chunks to PCM file...")
-    local startSec = FAST_START_SECONDS
-    local chunkNum = 2
-
-    while true do
-        if karaoke:shouldStop() then
-            karaoke:log("Phase 3 cancelled")
-            break
-        end
-
-        local decodeEnd = startSec + STREAM_CHUNK_SECONDS
-        karaoke:log("Phase 3: decoding " .. startSec .. "s-" .. decodeEnd .. "s...")
-        local segPcm = karaoke:decodeAudioRange(audioPath, startSec, decodeEnd)
-        if segPcm == nil then
-            karaoke:logError("Phase 3: decodeAudioRange failed at " .. startSec .. "s")
-            break
-        end
-        local segLen = karaoke:pcmLength(segPcm)
-        local segSecs = segLen / SAMPLE_RATE
-
-        if segSecs < 2 then
-            karaoke:log("Phase 3: reached end of song")
-            break
-        end
-
-        -- Render the segment.
-        karaoke:fireProgress(0.70, "Removing vocals... chunk " .. chunkNum)
-        local segRenderer = karaoke:createRenderer(segPcm)
-        karaoke:renderUntil(segRenderer, segLen - 1)
-        if karaoke:shouldStop() then break end
-
-        local segOut = karaoke:getOutput(segRenderer)
-        karaoke:applyBackgroundVocal(segOut, segPcm, bgLevel)
-
-        -- Append PCM to the growing file.
-        if karaoke:appendPcm(segOut, pcmPath) then
-            karaoke:log("Phase 3: chunk " .. chunkNum .. " appended (" .. string.format("%.1f", segSecs) .. "s)")
-        else
-            karaoke:logError("Phase 3: failed to append chunk " .. chunkNum)
-            break
-        end
-
-        -- Free segment memory.
-        segPcm = nil
-        segRenderer = nil
-        segOut = nil
-        collectgarbage("collect")
-
-        chunkNum = chunkNum + 1
-        startSec = startSec + STREAM_CHUNK_SECONDS
-
-        if segSecs < STREAM_CHUNK_SECONDS - 1 then
-            karaoke:log("Phase 3: last chunk appended")
-            break
-        end
+    if not karaoke:isStreamComplete(handle) then
+        karaoke:logError("render did not complete")
+        return nil
     end
 
-    -- 9. Done. Signal EOF.
+    -- 7. Mark for instant replay, clean up, done.
+    karaoke:markStreamComplete(videoId, bgLevel)
     karaoke:deleteFile(audioPath)
-    karaoke:log("STREAMING COMPLETE: PCM file ready: " .. pcmPath)
+    karaoke:log("STREAMING COMPLETE: " .. pcmPath)
     karaoke:fireProgress(1.0, "Done")
     karaoke:fireComplete(pcmPath)
-
     return pcmPath
 end
