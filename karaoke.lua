@@ -1,16 +1,15 @@
--- karaoke.lua v3 - KaraokeNow vocal removal pipeline
+-- karaoke.lua v4 - KaraokeNow vocal removal pipeline
 -- This script orchestrates the karaoke preparation flow.
 -- Heavy lifting (download, decode, AI inference, WAV I/O) is done by
 -- the Kotlin bridge exposed as the global `karaoke`.
 --
--- v3: Full-song support. Phase 1+2 do 30s fast-start as before.
---     Phase 3 decodes the full song in background, renders it,
---     and swaps to the full version. The 30s file is NOT cached;
---     only the full song goes to cache.
+-- v4: Fast startup. Decode 10s (not 30s), render 2 windows (~8s),
+--     start playing. Full song renders in background (Phase 3).
+--     Like the Chrome extension: small chunks, continuous background work.
 
 local SAMPLE_RATE = 44100
-local FIRST_CHUNK_SECONDS = 15
-local FAST_START_SECONDS = 30
+local FIRST_CHUNK_SECONDS = 8
+local FAST_START_SECONDS = 10
 
 --- Main entry point. Called from Kotlin.
 --- @param videoId string YouTube video ID
@@ -52,7 +51,9 @@ function prepare(videoId, audioUrl, bgLevel)
     end
 
     -- 4. Decode to 44.1kHz PCM.
-    -- OPTIMIZATION: Decode only 30s for fast startup (not the full song).
+    -- OPTIMIZATION: Decode only 10s for fast startup (not the full song).
+    -- v4: Reduced from 30s to 10s. Render 2 windows (~8s) and start playing.
+    -- The full song renders in background (Phase 3).
     karaoke:fireProgress(0.15, "Decoding audio...")
     local pcm = karaoke:decodeAudioPartial(audioPath, FAST_START_SECONDS)
     if pcm == nil then
@@ -96,56 +97,53 @@ function prepare(videoId, audioUrl, bgLevel)
     end
     if karaoke:shouldStop() then return nil end
 
-    -- Phase 2: render the rest of the 30s partial in the background.
-    -- Write to a TEMP file (not cache) — the 30s version is just for fast startup.
+    -- Phase 2: render the rest of the 10s fast-start in the background.
+    -- Write to a TEMP file (not cache) — the 10s version is just for fast startup.
     karaoke:fireProgress(0.50, "Finishing first part...")
-    karaoke:log("Phase 2: rendering remaining partial (30s)...")
+    karaoke:log("Phase 2: rendering remaining fast-start (" .. FAST_START_SECONDS .. "s)...")
     karaoke:renderUntil(renderer, pcmLen - 1)
     if karaoke:shouldStop() then return nil end
 
     local out = karaoke:getOutput(renderer)
     karaoke:applyBackgroundVocal(out, pcm, bgLevel)
-    local temp30Path = karaoke:cacheDir() .. "/" .. videoId .. "-karaoke-30s.wav"
-    if not karaoke:writeWav(out, temp30Path) then
-        karaoke:logError("failed to write 30s WAV")
+    local temp10Path = karaoke:cacheDir() .. "/" .. videoId .. "-karaoke-10s.wav"
+    if not karaoke:writeWav(out, temp10Path) then
+        karaoke:logError("failed to write 10s WAV")
         return nil
     end
     karaoke:deleteFile(partialPath)
 
-    karaoke:log("30s version ready: " .. temp30Path)
+    karaoke:log("10s version ready: " .. temp10Path)
     karaoke:fireProgress(0.70, "Loading full song...")
-    karaoke:fireComplete(temp30Path)
-    if karaoke:shouldStop() then return temp30Path end
+    karaoke:fireComplete(temp10Path)
+    if karaoke:shouldStop() then return temp10Path end
 
     -- If first chunk never fired (very short audio?), fire now.
     if not firstChunkFired then
-        karaoke:fireFirstChunk(temp30Path)
+        karaoke:fireFirstChunk(temp10Path)
     end
 
     -- Phase 3: Full song in background.
-    -- The 30s version is playing. Now decode the FULL song, render it,
+    -- The 10s version is playing. Now decode the FULL song, render it,
     -- and swap to the full version. Only the full song goes to cache.
     karaoke:log("Phase 3: decoding full song in background...")
     local fullPcm = karaoke:decodeAudio(audioPath)
     if fullPcm == nil then
-        karaoke:logError("FAILED at decodeAudio (full), keeping 30s version")
-        return temp30Path
+        karaoke:logError("FAILED at decodeAudio (full), keeping 10s version")
+        return temp10Path
     end
     local fullLen = karaoke:pcmLength(fullPcm)
     karaoke:log("decoded full: " .. fullLen .. " samples (" .. string.format("%.1f", fullLen / SAMPLE_RATE) .. "s)")
-    if karaoke:shouldStop() then return temp30Path end
+    if karaoke:shouldStop() then return temp10Path end
 
-    -- If the full song is barely longer than 30s, just keep the 30s version.
+    -- If the full song is barely longer than 10s, just keep the 10s version.
     if fullLen <= pcmLen + SAMPLE_RATE * 5 then
-        karaoke:log("full song not much longer than 30s (" .. string.format("%.1f", fullLen / SAMPLE_RATE) .. "s), keeping 30s version")
-        -- Promote the 30s to cache so we don't redo this next time.
+        karaoke:log("full song not much longer than 10s (" .. string.format("%.1f", fullLen / SAMPLE_RATE) .. "s), keeping 10s version")
         local key = karaoke:cacheKey(videoId, bgLevel)
         local cachePath = karaoke:cacheDir() .. "/" .. key
         karaoke:deleteFile(cachePath)
-        -- Note: no rename API, so we leave the 30s temp file. Next run will redo Phase 3.
-        -- This is a rare edge case (songs < 35s), acceptable.
         karaoke:fireProgress(1.0, "Done")
-        return temp30Path
+        return temp10Path
     end
 
     karaoke:fireProgress(0.80, "Removing vocals (full song)...")
@@ -158,8 +156,8 @@ function prepare(videoId, audioUrl, bgLevel)
     local rendered = 0
     while rendered < fullLen - 1 do
         if karaoke:shouldStop() then
-            karaoke:log("Phase 3 cancelled, keeping 30s version")
-            return temp30Path
+            karaoke:log("Phase 3 cancelled, keeping 10s version")
+            return temp10Path
         end
         local target = math.min(rendered + chunkSize, fullLen - 1)
         rendered = karaoke:renderUntil(fullRenderer, target)
@@ -177,12 +175,12 @@ function prepare(videoId, audioUrl, bgLevel)
     local cachePath = karaoke:cacheDir() .. "/" .. key
     karaoke:log("Phase 3: writing full song to cache: " .. cachePath)
     if not karaoke:writeWav(fullOut, cachePath) then
-        karaoke:logError("failed to write full song WAV, keeping 30s version")
-        return temp30Path
+        karaoke:logError("failed to write full song WAV, keeping 10s version")
+        return temp10Path
     end
 
     -- Clean up temp files.
-    karaoke:deleteFile(temp30Path)
+    karaoke:deleteFile(temp10Path)
     karaoke:deleteFile(audioPath)
 
     karaoke:log("FULL SONG COMPLETE: " .. cachePath .. " (" .. string.format("%.1f", fullLen / SAMPLE_RATE) .. "s)")
