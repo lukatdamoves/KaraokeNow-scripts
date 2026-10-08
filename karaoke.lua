@@ -1,11 +1,11 @@
--- karaoke.lua v4 - KaraokeNow vocal removal pipeline
+-- karaoke.lua v5 - KaraokeNow vocal removal pipeline
 -- This script orchestrates the karaoke preparation flow.
 -- Heavy lifting (download, decode, AI inference, WAV I/O) is done by
 -- the Kotlin bridge exposed as the global `karaoke`.
 --
--- v4: Fast startup. Decode 10s (not 30s), render 2 windows (~8s),
---     start playing. Full song renders in background (Phase 3).
+-- v5: Progressive chunks. 10s fast-start, then 30s increments.
 --     Like the Chrome extension: small chunks, continuous background work.
+--     Render speed (1.7x real-time) stays ahead of playback.
 
 local SAMPLE_RATE = 44100
 local FIRST_CHUNK_SECONDS = 8
@@ -147,40 +147,64 @@ function prepare(videoId, audioUrl, bgLevel)
     end
 
     karaoke:fireProgress(0.80, "Removing vocals (full song)...")
-    karaoke:log("Phase 3: rendering full song (" .. string.format("%.1f", fullLen / SAMPLE_RATE) .. "s)...")
+    karaoke:log("Phase 3: rendering full song in 30s chunks (" .. string.format("%.1f", fullLen / SAMPLE_RATE) .. "s total)...")
     local fullRenderer = karaoke:createRenderer(fullPcm)
     
-    -- Render progressively with progress updates.
-    -- We render in chunks to give progress feedback and allow cancellation.
+    -- Render in 30s chunks, swapping to longer files as they're ready.
+    -- Render speed (1.7x real-time) stays ahead of playback.
     local chunkSize = SAMPLE_RATE * 30  -- 30s chunks
     local rendered = 0
+    local chunkNum = 0
+    local key = karaoke:cacheKey(videoId, bgLevel)
+    local cachePath = karaoke:cacheDir() .. "/" .. key
+    
     while rendered < fullLen - 1 do
         if karaoke:shouldStop() then
-            karaoke:log("Phase 3 cancelled, keeping 10s version")
-            return temp10Path
+            karaoke:log("Phase 3 cancelled")
+            return cachePath
         end
         local target = math.min(rendered + chunkSize, fullLen - 1)
         rendered = karaoke:renderUntil(fullRenderer, target)
+        chunkNum = chunkNum + 1
+        
         local progress = 0.80 + 0.15 * (rendered / fullLen)
-        karaoke:fireProgress(progress, "Removing vocals (full song)... " .. string.format("%.0f", 100 * rendered / fullLen) .. "%")
-        karaoke:log("Phase 3 progress: " .. string.format("%.1f", rendered / SAMPLE_RATE) .. "s / " .. string.format("%.1f", fullLen / SAMPLE_RATE) .. "s")
+        karaoke:fireProgress(progress, "Removing vocals... " .. string.format("%.0f", 100 * rendered / fullLen) .. "%")
+        karaoke:log("Phase 3 chunk " .. chunkNum .. ": " .. string.format("%.1f", rendered / SAMPLE_RATE) .. "s / " .. string.format("%.1f", fullLen / SAMPLE_RATE) .. "s")
+        
+        -- Write the current progress to a temp file and swap to it.
+        -- This keeps playback going with the longest available audio.
+        local chunkOut = karaoke:getOutput(fullRenderer)
+        -- Slice to the rendered length to avoid unrendered tail.
+        local chunkPcm = karaoke:slice(chunkOut, rendered)
+        karaoke:applyBackgroundVocal(chunkPcm, fullPcm, bgLevel)
+        local chunkPath = karaoke:cacheDir() .. "/" .. videoId .. "-karaoke-chunk" .. chunkNum .. ".wav"
+        if karaoke:writeWav(chunkPcm, chunkPath) then
+            karaoke:log("Phase 3: swapping to " .. string.format("%.1f", rendered / SAMPLE_RATE) .. "s version")
+            karaoke:fireComplete(chunkPath)
+            -- Clean up previous chunk (keep the latest).
+            if chunkNum > 1 then
+                karaoke:deleteFile(karaoke:cacheDir() .. "/" .. videoId .. "-karaoke-chunk" .. (chunkNum - 1) .. ".wav")
+            end
+        else
+            karaoke:logError("Phase 3: failed to write chunk " .. chunkNum)
+        end
+        
         if rendered >= fullLen - 1 then break end
     end
 
+    -- Final: write the complete song to the cache key.
     local fullOut = karaoke:getOutput(fullRenderer)
     karaoke:applyBackgroundVocal(fullOut, fullPcm, bgLevel)
     
-    -- Write to the cache key (this is the permanent full-song version).
-    local key = karaoke:cacheKey(videoId, bgLevel)
-    local cachePath = karaoke:cacheDir() .. "/" .. key
     karaoke:log("Phase 3: writing full song to cache: " .. cachePath)
     if not karaoke:writeWav(fullOut, cachePath) then
-        karaoke:logError("failed to write full song WAV, keeping 10s version")
-        return temp10Path
+        karaoke:logError("failed to write full song WAV")
+        return chunkPath
     end
 
     -- Clean up temp files.
     karaoke:deleteFile(temp10Path)
+    karaoke:deleteFile(karaoke:cacheDir() .. "/" .. videoId .. "-karaoke-chunk" .. chunkNum .. ".wav")
     karaoke:deleteFile(audioPath)
 
     karaoke:log("FULL SONG COMPLETE: " .. cachePath .. " (" .. string.format("%.1f", fullLen / SAMPLE_RATE) .. "s)")
