@@ -29,7 +29,7 @@
 local SAMPLE_RATE = 44100
 -- First chunk threshold: fires after the 2nd window (8.89s of audio,
 -- ~4.5s wall) - enough buffer that playback never starves afterwards.
-local FIRST_CHUNK_SECONDS = 8
+local FIRST_CHUNK_SECONDS = 4
 
 --- Main entry point. Called from Kotlin.
 --- @param videoId string YouTube video ID
